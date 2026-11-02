@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Play, Pause, Square, Clock, Timer, Tag, FileText, MapPin, Plus } from 'lucide-react';
+import { Play, Pause, Square, Clock, Timer, Tag, FileText, Bell } from 'lucide-react';
 import { supabase, AppUser } from '@/lib/supabase';
 import { MODULES } from '@/lib/utils';
 import toast from 'react-hot-toast';
@@ -15,23 +15,44 @@ interface LiveTimerProps {
 type TimerMode = 'stopwatch' | 'pomodoro';
 type PomodoroPhase = 'focus' | 'break';
 
+const STORAGE_KEY = 'vyfster_active_timer_v1';
+const FOCUS_SECS = 25 * 60;
+const BREAK_SECS = 5 * 60;
+
+interface SavedTimerState {
+  running: boolean;
+  startTime: number | null; // epoch ms when last resumed
+  accumulatedElapsed: number; // seconds accumulated before current run
+  mode: TimerMode;
+  module: string;
+  description: string;
+  sessionStartedAt: string; // ISO string of initial session start
+  pomPhase: PomodoroPhase;
+  pomPhaseStart: number | null; // epoch ms when current phase resumed
+  pomPhaseAccumulated: number;
+  pomCycles: number;
+}
+
 export default function LiveTimer({ user, onLogSaved }: LiveTimerProps) {
   const [mode, setMode] = useState<TimerMode>('stopwatch');
   const [running, setRunning] = useState(false);
-  const [elapsed, setElapsed] = useState(0); // seconds
-  const [startTime, setStartTime] = useState<Date | null>(null);
+  const [elapsed, setElapsed] = useState(0); // Total seconds for current session
   const [module, setModule] = useState(MODULES[0]);
   const [description, setDescription] = useState('');
   const [saving, setSaving] = useState(false);
 
+  // Wall-clock refs & state
+  const startTimeRef = useRef<number | null>(null);
+  const accumulatedRef = useRef<number>(0);
+  const sessionStartedAtRef = useRef<Date | null>(null);
+
   // Pomodoro
   const [pomPhase, setPomPhase] = useState<PomodoroPhase>('focus');
   const [pomCycles, setPomCycles] = useState(0);
-  const FOCUS_SECS = 25 * 60;
-  const BREAK_SECS = 5 * 60;
+  const pomPhaseStartRef = useRef<number | null>(null);
+  const pomPhaseAccumulatedRef = useRef<number>(0);
   const pomTotal = pomPhase === 'focus' ? FOCUS_SECS : BREAK_SECS;
 
-  const intervalRef = useRef<NodeJS.Timeout | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
 
   const playBeep = useCallback((freq = 880, duration = 0.3) => {
@@ -40,6 +61,9 @@ export default function LiveTimer({ user, onLogSaved }: LiveTimerProps) {
         audioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
       }
       const ctx = audioCtxRef.current;
+      if (ctx.state === 'suspended') {
+        ctx.resume();
+      }
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
       osc.connect(gain);
@@ -52,56 +76,225 @@ export default function LiveTimer({ user, onLogSaved }: LiveTimerProps) {
     } catch {}
   }, []);
 
+  const saveToStorage = useCallback((partial?: Partial<SavedTimerState>) => {
+    try {
+      const state: SavedTimerState = {
+        running,
+        startTime: startTimeRef.current,
+        accumulatedElapsed: accumulatedRef.current,
+        mode,
+        module,
+        description,
+        sessionStartedAt: sessionStartedAtRef.current ? sessionStartedAtRef.current.toISOString() : new Date().toISOString(),
+        pomPhase,
+        pomPhaseStart: pomPhaseStartRef.current,
+        pomPhaseAccumulated: pomPhaseAccumulatedRef.current,
+        pomCycles,
+        ...partial,
+      };
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    } catch {}
+  }, [running, mode, module, description, pomPhase, pomCycles]);
+
+  const clearStorage = () => {
+    try {
+      localStorage.removeItem(STORAGE_KEY);
+    } catch {}
+  };
+
+  // Recompute true elapsed time from real timestamps
+  const syncElapsed = useCallback(() => {
+    const now = Date.now();
+
+    // 1. Stopwatch sync
+    let totalSecs = accumulatedRef.current;
+    if (startTimeRef.current) {
+      totalSecs += Math.floor((now - startTimeRef.current) / 1000);
+    }
+    setElapsed(Math.max(0, totalSecs));
+
+    // 2. Pomodoro sync
+    if (mode === 'pomodoro' && pomPhaseStartRef.current) {
+      const currentPhaseSecs = pomPhaseAccumulatedRef.current + Math.floor((now - pomPhaseStartRef.current) / 1000);
+      const limit = pomPhase === 'focus' ? FOCUS_SECS : BREAK_SECS;
+
+      if (currentPhaseSecs >= limit) {
+        // Switch phase
+        if (pomPhase === 'focus') {
+          setPomPhase('break');
+          setPomCycles(c => c + 1);
+          pomPhaseAccumulatedRef.current = 0;
+          pomPhaseStartRef.current = now;
+          playBeep(660, 0.5);
+          toast('🎉 Focus phase complete! Take a break.', { icon: '☕' });
+        } else {
+          setPomPhase('focus');
+          pomPhaseAccumulatedRef.current = 0;
+          pomPhaseStartRef.current = now;
+          playBeep(880, 0.5);
+          toast('⚡ Break over! Back to focus.', { icon: '🔥' });
+        }
+      }
+    }
+  }, [mode, pomPhase, playBeep]);
+
+  // Load persisted session on initial mount
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return;
+      const saved: SavedTimerState = JSON.parse(raw);
+      if (!saved) return;
+
+      setMode(saved.mode || 'stopwatch');
+      setModule(saved.module || MODULES[0]);
+      setDescription(saved.description || '');
+      setPomPhase(saved.pomPhase || 'focus');
+      setPomCycles(saved.pomCycles || 0);
+
+      accumulatedRef.current = saved.accumulatedElapsed || 0;
+      pomPhaseAccumulatedRef.current = saved.pomPhaseAccumulated || 0;
+
+      if (saved.sessionStartedAt) {
+        sessionStartedAtRef.current = new Date(saved.sessionStartedAt);
+      }
+
+      if (saved.running && saved.startTime) {
+        startTimeRef.current = saved.startTime;
+        pomPhaseStartRef.current = saved.pomPhaseStart || saved.startTime;
+        setRunning(true);
+        // Calculate true elapsed right now
+        const now = Date.now();
+        const currentElapsed = saved.accumulatedElapsed + Math.floor((now - saved.startTime) / 1000);
+        setElapsed(Math.max(0, currentElapsed));
+      } else {
+        startTimeRef.current = null;
+        pomPhaseStartRef.current = null;
+        setRunning(false);
+        setElapsed(saved.accumulatedElapsed || 0);
+      }
+    } catch {}
+  }, []);
+
+  // Sync on visibility change (when switching back to tab or unlocking phone)
+  useEffect(() => {
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible' && running) {
+        syncElapsed();
+      }
+    };
+    const handleFocus = () => {
+      if (running) syncElapsed();
+    };
+
+    document.addEventListener('visibilitychange', handleVisibility);
+    window.addEventListener('focus', handleFocus);
+    window.addEventListener('pageshow', handleFocus);
+
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibility);
+      window.removeEventListener('focus', handleFocus);
+      window.removeEventListener('pageshow', handleFocus);
+    };
+  }, [running, syncElapsed]);
+
+  // Regular tick while tab is open
+  useEffect(() => {
+    if (!running) return;
+
+    const interval = setInterval(() => {
+      syncElapsed();
+    }, 1000);
+
+    return () => clearInterval(interval);
+  }, [running, syncElapsed]);
+
+  // Update browser tab title with active timer
   useEffect(() => {
     if (running) {
-      intervalRef.current = setInterval(() => {
-        setElapsed(prev => {
-          const next = prev + 1;
-          // Pomodoro phase switch
-          if (mode === 'pomodoro' && next >= pomTotal) {
-            if (pomPhase === 'focus') {
-              setPomPhase('break');
-              setPomCycles(c => c + 1);
-              playBeep(660, 0.5);
-              toast('🎉 Focus phase done! Take a break.', { icon: '⏰' });
-            } else {
-              setPomPhase('focus');
-              playBeep(880, 0.5);
-              toast('🔥 Break over! Back to work.', { icon: '⚡' });
-            }
-            return 0;
-          }
-          return next;
-        });
-      }, 1000);
+      const displaySecs = mode === 'pomodoro' ? Math.max(0, pomTotal - elapsed) : elapsed;
+      const h = Math.floor(displaySecs / 3600);
+      const m = Math.floor((displaySecs % 3600) / 60);
+      const s = displaySecs % 60;
+      const timeStr = h > 0
+        ? `${h}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`
+        : `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+      document.title = `(${timeStr}) Vyfster Focus`;
     } else {
-      if (intervalRef.current) clearInterval(intervalRef.current);
+      document.title = 'Vyfster Focus — Corridor Study Tracker';
     }
-    return () => { if (intervalRef.current) clearInterval(intervalRef.current); };
-  }, [running, mode, pomPhase, pomTotal, playBeep]);
+
+    return () => {
+      document.title = 'Vyfster Focus — Corridor Study Tracker';
+    };
+  }, [running, elapsed, mode, pomTotal]);
 
   const handleStart = () => {
+    const now = Date.now();
     if (!running) {
-      setStartTime(prev => prev ?? new Date());
+      // Starting or Resuming
+      startTimeRef.current = now;
+      pomPhaseStartRef.current = now;
+      if (!sessionStartedAtRef.current) {
+        sessionStartedAtRef.current = new Date(now - accumulatedRef.current * 1000);
+      }
       setRunning(true);
+      saveToStorage({
+        running: true,
+        startTime: now,
+        pomPhaseStart: now,
+      });
+
+      // Request browser notification permission for background alerts if supported
+      if (typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'default') {
+        Notification.requestPermission().catch(() => {});
+      }
     } else {
+      // Pausing
+      if (startTimeRef.current) {
+        const added = Math.floor((now - startTimeRef.current) / 1000);
+        accumulatedRef.current += added;
+      }
+      if (pomPhaseStartRef.current) {
+        const addedPhase = Math.floor((now - pomPhaseStartRef.current) / 1000);
+        pomPhaseAccumulatedRef.current += addedPhase;
+      }
+      startTimeRef.current = null;
+      pomPhaseStartRef.current = null;
       setRunning(false);
+      setElapsed(accumulatedRef.current);
+      saveToStorage({
+        running: false,
+        startTime: null,
+        pomPhaseStart: null,
+        accumulatedElapsed: accumulatedRef.current,
+        pomPhaseAccumulated: pomPhaseAccumulatedRef.current,
+      });
     }
   };
 
   const handleStop = async () => {
-    if (!startTime && elapsed === 0) return;
+    const now = Date.now();
+    let finalSecs = accumulatedRef.current;
+    if (startTimeRef.current) {
+      finalSecs += Math.floor((now - startTimeRef.current) / 1000);
+    }
+
+    if (finalSecs <= 0 && !sessionStartedAtRef.current) return;
+
     setRunning(false);
-    if (intervalRef.current) clearInterval(intervalRef.current);
+    startTimeRef.current = null;
+    pomPhaseStartRef.current = null;
+    clearStorage();
 
     const endTime = new Date();
-    const actualStart = startTime ?? new Date(endTime.getTime() - elapsed * 1000);
+    const actualStart = sessionStartedAtRef.current ?? new Date(endTime.getTime() - finalSecs * 1000);
 
     setSaving(true);
     const { error } = await supabase.from('study_logs').insert({
       user_id: user.id,
       module_code: module,
-      description: description || null,
+      description: description.trim() || null,
       start_time: actualStart.toISOString(),
       end_time: endTime.toISOString(),
       is_verified_location: false,
@@ -113,12 +306,15 @@ export default function LiveTimer({ user, onLogSaved }: LiveTimerProps) {
     } else {
       playBeep(440, 0.2);
       setTimeout(() => playBeep(660, 0.3), 200);
-      toast.success(`Session saved! ${formatTime(elapsed)} of ${module}`);
+      toast.success(`Session saved! ${formatTime(finalSecs)} of ${module}`);
       onLogSaved();
     }
 
+    // Reset everything
+    accumulatedRef.current = 0;
+    sessionStartedAtRef.current = null;
+    pomPhaseAccumulatedRef.current = 0;
     setElapsed(0);
-    setStartTime(null);
     setPomPhase('focus');
     setPomCycles(0);
     setDescription('');
@@ -126,15 +322,16 @@ export default function LiveTimer({ user, onLogSaved }: LiveTimerProps) {
   };
 
   const formatTime = (secs: number) => {
-    const h = Math.floor(secs / 3600);
-    const m = Math.floor((secs % 3600) / 60);
-    const s = secs % 60;
+    const safeSecs = Math.max(0, secs);
+    const h = Math.floor(safeSecs / 3600);
+    const m = Math.floor((safeSecs % 3600) / 60);
+    const s = safeSecs % 60;
     if (h > 0) return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
     return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
   };
 
-  const pomProgress = mode === 'pomodoro' ? (elapsed / pomTotal) * 100 : 0;
-  const displayTime = mode === 'pomodoro' ? pomTotal - elapsed : elapsed;
+  const pomProgress = mode === 'pomodoro' ? Math.min(100, (elapsed / pomTotal) * 100) : 0;
+  const displayTime = mode === 'pomodoro' ? Math.max(0, pomTotal - elapsed) : elapsed;
 
   return (
     <motion.div
@@ -153,7 +350,18 @@ export default function LiveTimer({ user, onLogSaved }: LiveTimerProps) {
           {(['stopwatch', 'pomodoro'] as const).map(m => (
             <button
               key={m}
-              onClick={() => { if (!running) { setMode(m); setElapsed(0); setPomPhase('focus'); } }}
+              onClick={() => {
+                if (!running) {
+                  setMode(m);
+                  setElapsed(0);
+                  accumulatedRef.current = 0;
+                  pomPhaseAccumulatedRef.current = 0;
+                  setPomPhase('focus');
+                  clearStorage();
+                } else {
+                  toast('Stop the active timer to change mode', { icon: 'ℹ️' });
+                }
+              }}
               className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold capitalize transition-all duration-200 ${
                 mode === m ? 'bg-white text-black' : 'text-zinc-500 hover:text-zinc-300'
               }`}
@@ -209,9 +417,9 @@ export default function LiveTimer({ user, onLogSaved }: LiveTimerProps) {
         )}
 
         {running && (
-          <div className="flex items-center gap-1.5 text-xs text-zinc-500">
-            <span className="w-1.5 h-1.5 rounded-full bg-white animate-pulse" />
-            Recording…
+          <div className="flex items-center gap-2 text-xs text-zinc-400">
+            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+            <span>Tracking active in background</span>
           </div>
         )}
       </div>
@@ -251,7 +459,10 @@ export default function LiveTimer({ user, onLogSaved }: LiveTimerProps) {
           </label>
           <select
             value={module}
-            onChange={e => setModule(e.target.value)}
+            onChange={e => {
+              setModule(e.target.value);
+              saveToStorage({ module: e.target.value });
+            }}
             className="select text-sm"
           >
             {MODULES.map(m => <option key={m} value={m}>{m}</option>)}
@@ -263,7 +474,10 @@ export default function LiveTimer({ user, onLogSaved }: LiveTimerProps) {
           </label>
           <input
             value={description}
-            onChange={e => setDescription(e.target.value)}
+            onChange={e => {
+              setDescription(e.target.value);
+              saveToStorage({ description: e.target.value });
+            }}
             placeholder="Chapter 4 revision…"
             className="input text-sm"
           />
