@@ -122,6 +122,26 @@ export default function AdminPanel({ onRefresh }: AdminPanelProps) {
         toast.error('Failed to create session: ' + error.message);
       } else {
         toast.success('Mandatory session created!');
+
+        // Dispatch automated email notification to all registered corridor members
+        try {
+          const notifyRes = await fetch('/api/notify-session', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          });
+          const notifyData = await notifyRes.json();
+          if (notifyData.notConfigured) {
+            toast('Session scheduled! (Add email credentials to send automatic email alerts)', { icon: '📧' });
+          } else if (notifyData.success) {
+            toast.success(`📧 Email alerts sent to ${notifyData.recipientCount} corridor member(s)!`);
+          } else if (notifyData.error) {
+            toast.error('Email alert notice: ' + notifyData.error);
+          }
+        } catch (err: any) {
+          console.error('Failed to trigger email notification:', err);
+        }
+
         setShowCreateForm(false);
         setForm({
           title: '',
