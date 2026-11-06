@@ -253,22 +253,50 @@ export default function AdminPanel({ onRefresh, currentAdminId }: AdminPanelProp
         return;
       }
 
-      const res = await fetch('/api/admin/study-logs', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          logId: editingLog.id,
-          start_time: startDate.toISOString(),
-          end_time: endDate.toISOString(),
-          module_code: editModule,
-          description: editDescription,
-          adminUserId: currentAdminId,
-        }),
-      });
+      const { data: { session } } = await supabase.auth.getSession();
+      const token = session?.access_token;
 
-      const data = await res.json();
-      if (!res.ok || data.error) {
-        throw new Error(data.error || 'Failed to update study log');
+      let success = false;
+      try {
+        const res = await fetch('/api/admin/study-logs', {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          },
+          body: JSON.stringify({
+            logId: editingLog.id,
+            start_time: startDate.toISOString(),
+            end_time: endDate.toISOString(),
+            module_code: editModule,
+            description: editDescription,
+            adminUserId: currentAdminId,
+          }),
+        });
+
+        const data = await res.json();
+        if (res.ok && !data.error) {
+          success = true;
+        }
+      } catch (apiErr) {
+        console.warn('API route update attempt failed, falling back to direct client update:', apiErr);
+      }
+
+      // If API route failed or wasn't permitted, fallback to direct Supabase client (using user's admin RLS)
+      if (!success) {
+        const { error: directErr } = await supabase
+          .from('study_logs')
+          .update({
+            start_time: startDate.toISOString(),
+            end_time: endDate.toISOString(),
+            module_code: editModule?.trim() || 'STUDY',
+            description: editDescription?.trim() || null,
+          })
+          .eq('id', editingLog.id);
+
+        if (directErr) {
+          throw new Error(directErr.message || 'Failed to update study log');
+        }
       }
 
       toast.success('Study session time updated successfully!');
@@ -286,13 +314,36 @@ export default function AdminPanel({ onRefresh, currentAdminId }: AdminPanelProp
   const handleDeleteLog = async (logId: string) => {
     if (!confirm('Are you sure you want to delete this study session record?')) return;
     try {
-      const res = await fetch('/api/admin/study-logs', {
-        method: 'DELETE',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ logId, adminUserId: currentAdminId }),
-      });
-      const data = await res.json();
-      if (!res.ok || data.error) throw new Error(data.error);
+      const { data: { session } } = await supabase.auth.getSession();
+      const token = session?.access_token;
+
+      let success = false;
+      try {
+        const res = await fetch('/api/admin/study-logs', {
+          method: 'DELETE',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          },
+          body: JSON.stringify({ logId, adminUserId: currentAdminId }),
+        });
+        const data = await res.json();
+        if (res.ok && !data.error) {
+          success = true;
+        }
+      } catch (apiErr) {
+        console.warn('API route delete attempt failed, falling back to direct client delete:', apiErr);
+      }
+
+      if (!success) {
+        const { error: directErr } = await supabase
+          .from('study_logs')
+          .delete()
+          .eq('id', logId);
+
+        if (directErr) throw new Error(directErr.message);
+      }
+
       toast.success('Study session deleted');
       loadAll();
       onRefresh();

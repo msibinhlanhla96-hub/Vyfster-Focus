@@ -1,6 +1,22 @@
 import { NextResponse } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
 
+function getSupabaseClient(req: Request) {
+  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || '';
+  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  const authHeader = req.headers.get('Authorization');
+
+  if (serviceKey) {
+    return createClient(supabaseUrl, serviceKey);
+  }
+
+  return createClient(
+    supabaseUrl,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '',
+    authHeader ? { global: { headers: { Authorization: authHeader } } } : {}
+  );
+}
+
 export async function PUT(req: Request) {
   try {
     const body = await req.json();
@@ -13,9 +29,7 @@ export async function PUT(req: Request) {
       );
     }
 
-    const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || '';
-    const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '';
-    const supabase = createClient(supabaseUrl, supabaseKey);
+    const supabase = getSupabaseClient(req);
 
     // Verify requesting user is an admin
     const { data: userProfile, error: profileError } = await supabase
@@ -76,9 +90,7 @@ export async function DELETE(req: Request) {
       );
     }
 
-    const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || '';
-    const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '';
-    const supabase = createClient(supabaseUrl, supabaseKey);
+    const supabase = getSupabaseClient(req);
 
     // Verify admin
     const { data: userProfile } = await supabase
