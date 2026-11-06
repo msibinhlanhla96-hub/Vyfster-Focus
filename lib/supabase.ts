@@ -39,6 +39,7 @@ export interface StudyLog {
   is_manual: boolean;
   mandatory_session_id?: string;
   created_at: string;
+  users?: { full_name: string; room_number: string };
 }
 
 export interface MandatorySession {

@@ -26,6 +26,7 @@ export default function DashboardPage() {
   const [corridorMinutes, setCorridorMinutes] = useState(0);
   const [activeTab, setActiveTab] = useState<Tab>('dashboard');
   const [loading, setLoading] = useState(true);
+  const [timerRunning, setTimerRunning] = useState(false);
 
   const loadData = useCallback(async (userId: string) => {
     const [logsRes, sessionsRes, finesRes, lbRes, statsRes] = await Promise.all([
@@ -127,7 +128,8 @@ export default function DashboardPage() {
           <MandatorySessionBanner
             session={activeSessions[0]}
             user={user}
-            onClockIn={handleLogSaved}
+            studyLogs={studyLogs}
+            isTimerRunning={timerRunning}
           />
         )}
 
@@ -151,7 +153,12 @@ export default function DashboardPage() {
           <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
             {/* Left Column */}
             <div className="xl:col-span-2 flex flex-col gap-6">
-              <LiveTimer user={user} onLogSaved={handleLogSaved} />
+              <LiveTimer
+                user={user}
+                onLogSaved={handleLogSaved}
+                activeSession={activeSessions[0] || null}
+                onRunningChange={setTimerRunning}
+              />
               <PersonalStats studyLogs={studyLogs} user={user} />
             </div>
 
@@ -182,7 +189,7 @@ export default function DashboardPage() {
 
         {/* Admin Tab */}
         {activeTab === 'admin' && user.role === 'admin' && (
-          <AdminPanel onRefresh={() => loadData(user.id)} />
+          <AdminPanel onRefresh={() => loadData(user.id)} currentAdminId={user.id} />
         )}
       </main>
     </div>

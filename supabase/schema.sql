@@ -72,6 +72,14 @@ create policy "Students can update own logs"
   on public.study_logs for update
   using (auth.uid() = user_id);
 
+create policy "Admins can update all logs"
+  on public.study_logs for update
+  using (public.is_admin());
+
+create policy "Admins can delete any log"
+  on public.study_logs for delete
+  using (public.is_admin());
+
 create policy "Authenticated users can read all logs for stats and leaderboards"
   on public.study_logs for select
   using (auth.role() = 'authenticated');

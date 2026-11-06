@@ -2,14 +2,17 @@
 
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Play, Pause, Square, Clock, Timer, Tag, FileText, Bell } from 'lucide-react';
-import { supabase, AppUser } from '@/lib/supabase';
+import { Play, Pause, Square, Clock, Timer, Tag, FileText, MapPin, AlertTriangle, CheckCircle } from 'lucide-react';
+import { supabase, AppUser, MandatorySession } from '@/lib/supabase';
 import { MODULES } from '@/lib/utils';
+import { getCurrentPosition, isWithinGeofence } from '@/lib/haversine';
 import toast from 'react-hot-toast';
 
 interface LiveTimerProps {
   user: AppUser;
   onLogSaved: () => void;
+  activeSession?: MandatorySession | null;
+  onRunningChange?: (running: boolean) => void;
 }
 
 type TimerMode = 'stopwatch' | 'pomodoro';
@@ -28,18 +31,25 @@ interface SavedTimerState {
   description: string;
   sessionStartedAt: string; // ISO string of initial session start
   pomPhase: PomodoroPhase;
-  pomPhaseStart: number | null; // epoch ms when current phase resumed
+  pomPhaseStart: number | null;
   pomPhaseAccumulated: number;
   pomCycles: number;
+  linkedSessionId?: string | null;
+  isLocationVerified?: boolean;
 }
 
-export default function LiveTimer({ user, onLogSaved }: LiveTimerProps) {
+export default function LiveTimer({ user, onLogSaved, activeSession, onRunningChange }: LiveTimerProps) {
   const [mode, setMode] = useState<TimerMode>('stopwatch');
   const [running, setRunning] = useState(false);
   const [elapsed, setElapsed] = useState(0); // Total seconds for current session
   const [module, setModule] = useState(MODULES[0]);
   const [description, setDescription] = useState('');
   const [saving, setSaving] = useState(false);
+
+  // Mandatory session linkage & GPS verification state
+  const [linkedSessionId, setLinkedSessionId] = useState<string | null>(null);
+  const [isLocationVerified, setIsLocationVerified] = useState(false);
+  const [checkingGps, setCheckingGps] = useState(false);
 
   // Wall-clock refs & state
   const startTimeRef = useRef<number | null>(null);
@@ -90,11 +100,13 @@ export default function LiveTimer({ user, onLogSaved }: LiveTimerProps) {
         pomPhaseStart: pomPhaseStartRef.current,
         pomPhaseAccumulated: pomPhaseAccumulatedRef.current,
         pomCycles,
+        linkedSessionId,
+        isLocationVerified,
         ...partial,
       };
       localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
     } catch {}
-  }, [running, mode, module, description, pomPhase, pomCycles]);
+  }, [running, mode, module, description, pomPhase, pomCycles, linkedSessionId, isLocationVerified]);
 
   const clearStorage = () => {
     try {
@@ -119,7 +131,6 @@ export default function LiveTimer({ user, onLogSaved }: LiveTimerProps) {
       const limit = pomPhase === 'focus' ? FOCUS_SECS : BREAK_SECS;
 
       if (currentPhaseSecs >= limit) {
-        // Switch phase
         if (pomPhase === 'focus') {
           setPomPhase('break');
           setPomCycles(c => c + 1);
@@ -151,6 +162,8 @@ export default function LiveTimer({ user, onLogSaved }: LiveTimerProps) {
       setDescription(saved.description || '');
       setPomPhase(saved.pomPhase || 'focus');
       setPomCycles(saved.pomCycles || 0);
+      setLinkedSessionId(saved.linkedSessionId || null);
+      setIsLocationVerified(Boolean(saved.isLocationVerified));
 
       accumulatedRef.current = saved.accumulatedElapsed || 0;
       pomPhaseAccumulatedRef.current = saved.pomPhaseAccumulated || 0;
@@ -163,7 +176,7 @@ export default function LiveTimer({ user, onLogSaved }: LiveTimerProps) {
         startTimeRef.current = saved.startTime;
         pomPhaseStartRef.current = saved.pomPhaseStart || saved.startTime;
         setRunning(true);
-        // Calculate true elapsed right now
+        if (onRunningChange) onRunningChange(true);
         const now = Date.now();
         const currentElapsed = saved.accumulatedElapsed + Math.floor((now - saved.startTime) / 1000);
         setElapsed(Math.max(0, currentElapsed));
@@ -171,12 +184,13 @@ export default function LiveTimer({ user, onLogSaved }: LiveTimerProps) {
         startTimeRef.current = null;
         pomPhaseStartRef.current = null;
         setRunning(false);
+        if (onRunningChange) onRunningChange(false);
         setElapsed(saved.accumulatedElapsed || 0);
       }
     } catch {}
   }, []);
 
-  // Sync on visibility change (when switching back to tab or unlocking phone)
+  // Sync on visibility change
   useEffect(() => {
     const handleVisibility = () => {
       if (document.visibilityState === 'visible' && running) {
@@ -198,7 +212,7 @@ export default function LiveTimer({ user, onLogSaved }: LiveTimerProps) {
     };
   }, [running, syncElapsed]);
 
-  // Regular tick while tab is open
+  // Regular tick while open
   useEffect(() => {
     if (!running) return;
 
@@ -209,7 +223,7 @@ export default function LiveTimer({ user, onLogSaved }: LiveTimerProps) {
     return () => clearInterval(interval);
   }, [running, syncElapsed]);
 
-  // Update browser tab title with active timer
+  // Update browser tab title
   useEffect(() => {
     if (running) {
       const displaySecs = mode === 'pomodoro' ? Math.max(0, pomTotal - elapsed) : elapsed;
@@ -229,28 +243,102 @@ export default function LiveTimer({ user, onLogSaved }: LiveTimerProps) {
     };
   }, [running, elapsed, mode, pomTotal]);
 
-  const handleStart = () => {
+  // Check mandatory session & GPS verification when starting timer
+  const handleMandatoryVerification = async (session: MandatorySession) => {
+    setCheckingGps(true);
+    let verified = false;
+
+    try {
+      const pos = await getCurrentPosition();
+      const { latitude, longitude } = pos.coords;
+      verified = isWithinGeofence(latitude, longitude, session.lat, session.lng, session.radius_meters);
+      setIsLocationVerified(verified);
+
+      if (verified) {
+        toast.success('📍 GPS Verified: Inside corridor study zone!');
+      } else {
+        toast('📍 Remote: Outside corridor geofence (unverified)', { icon: '⚠️' });
+      }
+    } catch (err: any) {
+      setIsLocationVerified(false);
+      if (err.code === 1) {
+        toast('Location permission denied. Log marked as Remote.', { icon: '📍' });
+      }
+    } finally {
+      setCheckingGps(false);
+    }
+
+    // Check Punctuality & Late Fine
+    try {
+      const now = new Date();
+      const sessionStart = new Date(session.start_time);
+      const graceCutoff = new Date(sessionStart.getTime() + session.grace_period_mins * 60 * 1000);
+      const isLate = now > graceCutoff;
+
+      if (isLate) {
+        // Check if fine already logged to prevent duplicates
+        const { data: existingFine } = await supabase
+          .from('fines_ledger')
+          .select('id')
+          .eq('user_id', user.id)
+          .eq('session_id', session.id)
+          .maybeSingle();
+
+        if (!existingFine) {
+          const lateMinutes = Math.round((now.getTime() - graceCutoff.getTime()) / 60000);
+          await supabase.from('fines_ledger').insert({
+            user_id: user.id,
+            session_id: session.id,
+            amount: session.late_fine_amount,
+            reason: 'late',
+            status: 'unpaid',
+            notes: `Clocked in ${lateMinutes} min late via Study Timer`,
+          });
+          toast.error(`Late Clock-In: R${Number(session.late_fine_amount).toFixed(2)} fine applied`);
+        }
+      }
+    } catch (fineErr) {
+      console.error('Fine check error:', fineErr);
+    }
+
+    return verified;
+  };
+
+  const handleStart = async () => {
     const now = Date.now();
     if (!running) {
-      // Starting or Resuming
+      // STARTING OR RESUMING
       startTimeRef.current = now;
       pomPhaseStartRef.current = now;
       if (!sessionStartedAtRef.current) {
         sessionStartedAtRef.current = new Date(now - accumulatedRef.current * 1000);
       }
       setRunning(true);
+      if (onRunningChange) onRunningChange(true);
+
+      let verifiedLoc = isLocationVerified;
+      let sessionToLink = linkedSessionId;
+
+      // UNIFIED CHECK: If an active mandatory session is running, automatically link it!
+      if (activeSession) {
+        sessionToLink = activeSession.id;
+        setLinkedSessionId(activeSession.id);
+        verifiedLoc = await handleMandatoryVerification(activeSession);
+      }
+
       saveToStorage({
         running: true,
         startTime: now,
         pomPhaseStart: now,
+        linkedSessionId: sessionToLink,
+        isLocationVerified: verifiedLoc,
       });
 
-      // Request browser notification permission for background alerts if supported
       if (typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'default') {
         Notification.requestPermission().catch(() => {});
       }
     } else {
-      // Pausing
+      // PAUSING
       if (startTimeRef.current) {
         const added = Math.floor((now - startTimeRef.current) / 1000);
         accumulatedRef.current += added;
@@ -262,6 +350,7 @@ export default function LiveTimer({ user, onLogSaved }: LiveTimerProps) {
       startTimeRef.current = null;
       pomPhaseStartRef.current = null;
       setRunning(false);
+      if (onRunningChange) onRunningChange(false);
       setElapsed(accumulatedRef.current);
       saveToStorage({
         running: false,
@@ -273,6 +362,17 @@ export default function LiveTimer({ user, onLogSaved }: LiveTimerProps) {
     }
   };
 
+  // Listen for unified start-timer trigger from mandatory session banner
+  useEffect(() => {
+    const handleTriggerStart = () => {
+      if (!running) {
+        handleStart();
+      }
+    };
+    window.addEventListener('vyfster:start-timer', handleTriggerStart);
+    return () => window.removeEventListener('vyfster:start-timer', handleTriggerStart);
+  }, [running, activeSession, isLocationVerified, linkedSessionId]);
+
   const handleStop = async () => {
     const now = Date.now();
     let finalSecs = accumulatedRef.current;
@@ -283,6 +383,7 @@ export default function LiveTimer({ user, onLogSaved }: LiveTimerProps) {
     if (finalSecs <= 0 && !sessionStartedAtRef.current) return;
 
     setRunning(false);
+    if (onRunningChange) onRunningChange(false);
     startTimeRef.current = null;
     pomPhaseStartRef.current = null;
     clearStorage();
@@ -294,11 +395,12 @@ export default function LiveTimer({ user, onLogSaved }: LiveTimerProps) {
     const { error } = await supabase.from('study_logs').insert({
       user_id: user.id,
       module_code: module,
-      description: description.trim() || null,
+      description: description.trim() || (activeSession ? `Mandatory: ${activeSession.title}` : null),
       start_time: actualStart.toISOString(),
       end_time: endTime.toISOString(),
-      is_verified_location: false,
+      is_verified_location: isLocationVerified,
       is_manual: false,
+      mandatory_session_id: activeSession ? activeSession.id : (linkedSessionId || null),
     });
 
     if (error) {
@@ -318,6 +420,8 @@ export default function LiveTimer({ user, onLogSaved }: LiveTimerProps) {
     setPomPhase('focus');
     setPomCycles(0);
     setDescription('');
+    setLinkedSessionId(null);
+    setIsLocationVerified(false);
     setSaving(false);
   };
 
@@ -337,9 +441,10 @@ export default function LiveTimer({ user, onLogSaved }: LiveTimerProps) {
     <motion.div
       initial={{ opacity: 0, y: 16 }}
       animate={{ opacity: 1, y: 0 }}
+      id="live-study-timer"
       className="glass p-6"
     >
-      <div className="flex items-center justify-between mb-5">
+      <div className="flex items-center justify-between mb-4">
         <div className="flex items-center gap-2">
           <Clock size={16} className="text-zinc-400" />
           <h2 className="font-semibold text-white">Study Timer</h2>
@@ -372,6 +477,36 @@ export default function LiveTimer({ user, onLogSaved }: LiveTimerProps) {
           ))}
         </div>
       </div>
+
+      {/* Unified Mandatory Session Recognition Banner */}
+      {activeSession && (
+        <div className="mb-4 p-3 rounded-xl bg-red-500/10 border border-red-500/25 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <span className="w-2 h-2 rounded-full bg-red-400 animate-pulse" />
+            <div>
+              <span className="text-xs font-bold text-red-300 uppercase tracking-wider block">
+                Active Mandatory Session
+              </span>
+              <span className="text-sm font-semibold text-white">{activeSession.title}</span>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            {checkingGps ? (
+              <span className="text-xs text-zinc-400 flex items-center gap-1">
+                <MapPin size={11} className="animate-bounce" /> Checking GPS…
+              </span>
+            ) : isLocationVerified ? (
+              <span className="badge badge-green text-[10px]">
+                <CheckCircle size={10} /> Location Verified
+              </span>
+            ) : (
+              <span className="badge badge-yellow text-[10px]">
+                <MapPin size={10} /> Remote / Unverified
+              </span>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Pomodoro phase badge */}
       {mode === 'pomodoro' && (
@@ -435,7 +570,7 @@ export default function LiveTimer({ user, onLogSaved }: LiveTimerProps) {
               : 'bg-white text-black hover:bg-zinc-200'
           }`}
         >
-          {running ? <><Pause size={16} /> Pause</> : <><Play size={16} /> {elapsed > 0 ? 'Resume' : 'Start'}</>}
+          {running ? <><Pause size={16} /> Pause</> : <><Play size={16} /> {elapsed > 0 ? 'Resume' : 'Start Study Clock'}</>}
         </button>
 
         {(running || elapsed > 0) && (

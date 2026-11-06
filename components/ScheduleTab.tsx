@@ -31,7 +31,7 @@ export default function ScheduleTab({ sessions, user, onClockIn }: ScheduleTabPr
     >
       {/* Active sessions */}
       {active.map(s => (
-        <MandatorySessionBanner key={s.id} session={s} user={user} onClockIn={onClockIn} />
+        <MandatorySessionBanner key={s.id} session={s} user={user} />
       ))}
 
       {/* Upcoming */}
